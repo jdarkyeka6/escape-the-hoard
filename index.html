@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ESCAPE THE HORDE</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<canvas id="view"></canvas>
+
+<!-- ============ HUD ============ -->
+<div id="hud" class="hidden">
+
+  <div id="crosshair">
+    <span class="ch ch-t"></span><span class="ch ch-b"></span>
+    <span class="ch ch-l"></span><span class="ch ch-r"></span>
+  </div>
+
+  <div id="hitmarker"></div>
+  <div id="scope" class="hidden">
+    <div class="scope-ring"></div>
+    <span class="sv"></span><span class="sh"></span>
+    <span class="stick t"></span><span class="stick b"></span>
+    <span class="stick l"></span><span class="stick r"></span>
+  </div>
+  <div id="vignette"></div>
+  <div id="dmgEdges">
+    <span id="edgeT" class="de t"></span>
+    <span id="edgeB" class="de b"></span>
+    <span id="edgeL" class="de l"></span>
+    <span id="edgeR" class="de r"></span>
+  </div>
+  <div id="lowhp"></div>
+
+  <!-- top left: wave / threat readout -->
+  <div class="panel panel-tl">
+    <div class="brk"></div>
+    <div class="row"><span class="lbl">WAVE</span><span id="waveNum" class="big">1</span></div>
+    <div class="row hidden" id="wxRow">
+      <span class="lbl">WEATHER</span><span id="wxName" class="val">CLEAR</span>
+    </div>
+    <div class="row hidden" id="phaseRow">
+      <span id="phaseName" class="val moon">NIGHT</span><span id="phaseTime" class="val">5:00</span>
+    </div>
+    <div class="row"><span class="lbl">HOSTILES</span><span id="zLeft" class="val">0</span></div>
+    <div class="row"><span class="lbl">KILLS</span><span id="killNum" class="val">0</span></div>
+    <div class="row"><span class="lbl">SCORE</span><span id="scoreNum" class="val">0</span></div>
+  </div>
+
+  <!-- top right: minimap -->
+  <div class="panel panel-tr">
+    <div class="brk"></div>
+    <canvas id="minimap" width="180" height="180"></canvas>
+    <div class="maplbl">SECTOR SCAN</div>
+  </div>
+
+  <!-- bottom left: vitals + salvage -->
+  <div class="panel panel-bl">
+    <div class="brk"></div>
+    <div class="row"><span class="lbl">VITALS</span><span id="hpNum" class="val">100</span></div>
+    <div id="hpTrack"><div id="hpFill"></div></div>
+    <div id="resRow">
+      <span class="rchip wood"><i></i>PLANKS <b id="woodNum">0</b></span>
+      <span class="rchip scrap"><i></i>SCRAP <b id="scrapNum">0</b></span>
+    </div>
+  </div>
+
+  <!-- build palette, shown only in build mode -->
+  <div id="buildBar" class="panel hidden">
+    <div class="brk"></div>
+    <div id="buildList"></div>
+    <div id="buildHint">B EXIT &middot; 1&ndash;6 PICK &middot; R ROTATE &middot; LMB PLACE &middot; RMB REMOVE</div>
+  </div>
+
+  <div id="prompt"></div>
+
+  <!-- bottom right: weapon -->
+  <div class="panel panel-br">
+    <div class="brk"></div>
+    <div id="wepName">PISTOL</div>
+    <div id="ammoLine"><span id="ammoMag">14</span><span class="slash">/</span><span id="ammoRes">&#8734;</span></div>
+    <div id="reloadTag" class="hidden">RELOADING</div>
+    <div id="wepSlots"></div>
+  </div>
+
+  <div id="bossBar" class="hidden">
+    <div class="bossName">ABOMINATION</div>
+    <div id="bossTrack"><div id="bossFill"></div></div>
+    <div id="bossHp"></div>
+  </div>
+
+  <div id="banner"><span id="bannerText"></span></div>
+  <div id="toast"></div>
+</div>
+
+<!-- ============ START ============ -->
+<div id="start" class="screen">
+  <div class="sheet">
+    <div class="eyebrow">EMERGENCY BROADCAST &middot; PERTH METRO &middot; NO SIGNAL</div>
+    <h1>ESCAPE<br><span class="thin">THE HORDE</span></h1>
+    <p class="lede">They keep coming, and there is no last wave. Six strains, each with its own tell. Scavenge planks and scrap off the street, wall yourself in, take the high ground &mdash; and stay standing as long as you can.</p>
+
+    <div class="strains">
+      <div class="sr"><i style="background:#8fb06a"></i><b>GREEN</b><span>Walker &mdash; the baseline</span></div>
+      <div class="sr"><i style="background:#7fa8c4"></i><b>BLUE</b><span>Sprinter &mdash; lean, hunched, fast</span></div>
+      <div class="sr"><i style="background:#d8c452"></i><b>YELLOW</b><span>Bile &mdash; cracked skin, triple damage</span></div>
+      <div class="sr"><i style="background:#9a4a34"></i><b>RED</b><span>Burrower &mdash; tunnels, erupts underneath you</span></div>
+      <div class="sr"><i style="background:#4a4a52"></i><b>BLACK</b><span>Hulk &mdash; armoured, 5&times; health, knocks you flying</span></div>
+      <div class="sr"><i style="background:#d977a8"></i><b>PINK</b><span>Abomination &mdash; boss, every tenth wave</span></div>
+    </div>
+
+    <div class="keys">
+      <div class="kr"><b>W A S D</b><span>Move</span></div>
+      <div class="kr"><b>MOUSE</b><span>Look</span></div>
+      <div class="kr"><b>CLICK</b><span>Fire</span></div>
+      <div class="kr"><b>SHIFT</b><span>Sprint</span></div>
+      <div class="kr"><b>SPACE</b><span>Jump</span></div>
+      <div class="kr"><b>R</b><span>Reload</span></div>
+      <div class="kr"><b>RIGHT CLICK</b><span>Aim down sights</span></div>
+      <div class="kr"><b>1 &ndash; 8</b><span>Draw loadout slot</span></div>
+      <div class="kr"><b>WHEEL</b><span>Cycle weapons</span></div>
+      <div class="kr"><b>E</b><span>Gather / repair</span></div>
+      <div class="kr"><b>B</b><span>Build mode</span></div>
+      <div class="kr"><b>F / Q / X</b><span>Fire / aim / remove (trackpad)</span></div>
+      <div class="kr"><b>N</b><span>Call the night (in cycle mode)</span></div>
+      <div class="kr"><b>M</b><span>Mute audio</span></div>
+      <div class="kr"><b>ESC</b><span>Pause</span></div>
+    </div>
+
+    <div class="modeRow">
+      <button id="modeNight" class="pill on">NIGHT ONLY</button>
+      <button id="modeCycle" class="pill">DAY / NIGHT CYCLE</button>
+    </div>
+    <p id="modeNote" class="modeNote"></p>
+
+    <button id="playBtn">ENTER THE STREETS</button>
+    <button id="armouryBtn" class="ghost">ARMOURY</button>
+    <div id="menuScores"></div>
+
+    <div class="foot">Climb fire escapes, catwalks and scaffold towers. Build walls, ramps, platforms and spikes with <span class="hl">B</span>. Eight weapons unlock as you survive &mdash; SMG at wave 2, carbine at 5, magnum at 7, sniper at 9, LMG at 12, 40mm launcher at 15. Kills drop <span class="hl">medkits</span> and <span class="hl">ammo</span>. Headshots hurt more. Runs are endless.</div>
+  </div>
+</div>
+
+<!-- ============ PAUSE ============ -->
+<div id="pause" class="screen hidden">
+  <div class="sheet small">
+    <div class="eyebrow">SIGNAL HELD</div>
+    <h2>PAUSED</h2>
+    <p class="lede">The street is still out there.</p>
+    <div class="ctrlBlock">
+      <div class="ctrlHead">CONTROLS</div>
+      <div class="volRow">
+        <label for="sensSlider">LOOK SPEED</label>
+        <input id="sensSlider" type="range" min="20" max="400" value="100">
+        <span id="sensVal">1.00&times;</span>
+      </div>
+      <div class="volRow">
+        <button id="padBtn" class="pill">TRACKPAD MODE</button>
+        <button id="smoothBtn" class="pill">SMOOTHING</button>
+        <button id="invertBtn" class="pill">INVERT Y</button>
+      </div>
+      <div class="ctrlNote">
+        No mouse buttons needed: <b>F</b> fires (and places), <b>Q</b> toggles aim,
+        <b>X</b> removes a build piece. Trackpad mode raises look speed and turns on smoothing.
+      </div>
+    </div>
+
+    <div class="volRow">
+      <label for="volSlider">VOLUME</label>
+      <input id="volSlider" type="range" min="0" max="100" value="85">
+      <button id="muteBtn" class="pill">MUTE</button>
+    </div>
+    <button id="resumeBtn">RESUME</button>
+    <button id="pauseArmoury" class="ghost">LOADOUT</button>
+    <button id="quitBtn" class="ghost">ABANDON RUN</button>
+  </div>
+</div>
+
+<!-- ============ ARMOURY ============ -->
+<div id="armoury" class="screen hidden">
+  <div class="sheet wide">
+    <div class="eyebrow">ARMOURY &middot; SAVED BETWEEN RUNS</div>
+    <h2>LOADOUT</h2>
+    <p class="lede">Click a weapon to carry it or leave it in storage. Carried weapons are numbered in the order you add them &mdash; that number is the key you press in the field. Swatches repaint the gun. On <b>earn as you go</b>, every weapon waits for its own wave no matter which slot it sits in; if none of yours have come good yet you carry the M9 on loan, marked <b>*</b>.</p>
+
+    <div id="kitRow">
+      <button id="kitFull" class="pill">FULL KIT</button>
+      <button id="kitEarn" class="pill">EARN AS YOU GO</button>
+      <span id="loadoutCount"></span>
+    </div>
+
+    <div id="gunGrid"></div>
+
+    <button id="armouryDone">CONFIRM LOADOUT</button>
+  </div>
+</div>
+
+<!-- ============ DEAD ============ -->
+<div id="dead" class="screen hidden">
+  <div class="sheet small">
+    <div class="eyebrow blood">TRANSMISSION ENDS</div>
+    <h2>YOU WERE OVERRUN</h2>
+    <div id="finalStats"></div>
+    <button id="againBtn">RUN IT AGAIN</button>
+  </div>
+</div>
+
+<script src="three.min.js"></script>
+<script src="game.js"></script>
+</body>
+</html>
