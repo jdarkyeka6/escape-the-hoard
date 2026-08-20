@@ -25,7 +25,14 @@ html,body{
   -webkit-font-smoothing:antialiased;
 }
 
-#view{ position:fixed; inset:0; display:block; width:100%; height:100%; cursor:crosshair; }
+/* A cheap colour grade. The GPU is already compositing this layer, so lifting
+   contrast and pulling a touch of saturation costs nothing and stops the
+   street looking like flat untreated video. */
+#view{
+  position:fixed; inset:0; display:block; width:100%; height:100%; cursor:crosshair;
+  filter:contrast(1.07) saturate(1.06) brightness(1.02);
+}
+body.nograin #view{ filter:none; }
 
 .hidden{ display:none !important; }
 
@@ -135,6 +142,25 @@ html,body{
   position:absolute; inset:0; opacity:0;
   background:radial-gradient(ellipse at center, transparent 40%, rgba(190,34,28,.9) 100%);
 }
+
+/* Permanent lens vignette (separate from the red damage flash above) plus a
+   fine static grain. Both are pure CSS layers over the canvas — no extra
+   render pass, no shader, no frame cost worth measuring. */
+#grain{
+  position:absolute; inset:0; pointer-events:none; z-index:1;
+  background:
+    radial-gradient(ellipse at center, transparent 52%, rgba(0,0,0,.42) 100%),
+    repeating-conic-gradient(rgba(255,255,255,.028) 0% 25%, transparent 0% 50%);
+  background-size:100% 100%, 3px 3px;
+  mix-blend-mode:overlay;
+  opacity:.55;
+}
+body.nograin #grain{ display:none; }
+
+/* The grain is a blend layer, so anything you actually have to read has to sit
+   above it — otherwise the whole HUD gets tinted along with the street. */
+#hud .panel, #buildBar, #prompt, #banner, #toast, #bossBar,
+#crosshair, #scope, #hitmarker, #lowhp, #dmgEdges{ z-index:6; }
 
 /* edge bars light up on the side the hit came from */
 #dmgEdges{ position:absolute; inset:0; }
@@ -432,3 +458,19 @@ button.ghost:hover{ color:var(--bone); border-color:var(--bone); }
 .ctrlNote b{ color:var(--bone); letter-spacing:.12em; }
 #sensVal{ font-size:10px; letter-spacing:.1em; color:var(--bone);
           font-variant-numeric:tabular-nums; min-width:44px; }
+
+
+/* ---- co-op lobby row on the start screen ---- */
+.coopRow{
+  display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+  margin:14px 0 4px;
+}
+.coopRow input{
+  flex:1 1 130px; min-width:110px;
+  background:rgba(12,10,16,.75);
+  border:1px solid rgba(233,228,216,.22);
+  color:#e9e4d8; padding:9px 11px;
+  font:inherit; font-size:12px; letter-spacing:.14em; text-transform:uppercase;
+}
+.coopRow input:focus{ outline:none; border-color:rgba(255,182,74,.65); }
+.coopRow input::placeholder{ color:rgba(233,228,216,.35); letter-spacing:.14em; }

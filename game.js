@@ -22,6 +22,19 @@ const MAX_ZOMBIES = 46;      // hard cap on simultaneous zombies
 const STEP_P = 0.70;         // how high the player can step without jumping
 const STEP_Z = 0.75;         // and the zombies
 
+/* Movement feel. AIR_CTRL is the fraction of ground acceleration you get with
+   your feet off the floor: at 1.0 you could turn on a sixpence mid-jump, which
+   is why the old jumps felt weightless. At 0.3 a leap commits you. */
+const STAND_H   = 1.75;      // collision capsule height standing
+const CROUCH_H  = 1.05;      // ...and crouched, low enough to duck a barrier
+const CROUCH_EYE = 1.02;     // camera height when fully crouched
+const AIR_CTRL  = 0.30;
+const COYOTE    = 0.12;      // grace period to still jump after walking off
+const JUMP_BUF  = 0.16;      // press space early and it fires on landing
+const SLIDE_SPD = 13.0;
+const SLIDE_TIME = 0.62;
+const SLIDE_CD  = 0.55;
+
 /* Eight weapons, unlocked as the waves climb so there is always a next
    reward. `pierce` = extra zombies a round punches through, `zoom` = FOV
    multiplier when aiming down sights, `pickup` = rounds per ammo crate. */
@@ -527,6 +540,42 @@ renderer.setSize(innerWidth, innerHeight);
 renderer.autoClear = false;
 renderer.outputEncoding = T.sRGBEncoding;
 
+/* Filmic tone mapping. The old pipeline dumped raw linear colour on the screen,
+   so bright things clipped to flat white and everything else sat in a narrow
+   band of grey. ACES rolls the highlights off the way film does, which is why
+   muzzle flashes now bloom warm instead of turning into paper cutouts. */
+renderer.toneMapping = T.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.22;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = T.PCFSoftShadowMap;
+
+/* Three quality tiers. Shadow maps are the expensive part, so LOW drops them
+   entirely and pulls the render resolution back to 1:1. */
+const GFX_TIERS = {
+  high: { label:'HIGH', shadows:true,  shadowSize:2048, ratio:2,   grain:true  },
+  med:  { label:'MED',  shadows:true,  shadowSize:1024, ratio:1.5, grain:true  },
+  low:  { label:'LOW',  shadows:false, shadowSize:512,  ratio:1,   grain:false },
+};
+let gfxLevel = 'high';
+
+function applyQuality (level, recompile) {
+  if (!GFX_TIERS[level]) level = 'high';
+  gfxLevel = level;
+  const q = GFX_TIERS[level];
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, q.ratio));
+  renderer.setSize(innerWidth, innerHeight);
+  renderer.shadowMap.enabled = q.shadows;
+  sun.castShadow = q.shadows;
+  if (sun.shadow.mapSize.x !== q.shadowSize) {
+    sun.shadow.mapSize.set(q.shadowSize, q.shadowSize);
+    if (sun.shadow.map) { sun.shadow.map.dispose(); sun.shadow.map = null; }
+  }
+  document.body.classList.toggle('nograin', !q.grain);
+  // turning shadows on or off changes the shaders, so every material has to be
+  // rebuilt — only ever happens on a menu click, never mid-frame
+  if (recompile) scene.traverse(o => { if (o.isMesh && o.material) o.material.needsUpdate = true; });
+}
+
 const FOG = 0x272037;
 const scene = new T.Scene();
 scene.background = new T.Color(FOG);
@@ -540,11 +589,121 @@ const gunCam   = new T.PerspectiveCamera(58, innerWidth/innerHeight, 0.01, 12);
 
 const hemi = new T.HemisphereLight(0x7c85b8, 0x332c3a, 1.15);
 scene.add(hemi);
+
+/* The sun casts real shadows now. A directional light has no position in the
+   physical sense — only a direction — so instead of parking it over the map
+   and stretching one huge shadow map across 400 metres, it rides along above
+   the player with a tight 75-metre box. Same trick a torch on a helmet uses:
+   light only what you can actually see, at full detail. */
 const sun = new T.DirectionalLight(0xffd7ab, 0.80);
-sun.position.set(-70, 120, 60);
+const sunDir = new T.Vector3(-70, 120, 60).normalize();
+const sunTarget = new T.Object3D();
+scene.add(sunTarget);
+sun.target = sunTarget;
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -75;
+sun.shadow.camera.right = 75;
+sun.shadow.camera.top = 75;
+sun.shadow.camera.bottom = -75;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 320;
+sun.shadow.bias = -0.0008;
+sun.shadow.normalBias = 0.55;
+sun.shadow.radius = 2.2;
 scene.add(sun);
+
 const playerLamp = new T.PointLight(0xffd9a0, 1.15, 30, 2);
 scene.add(playerLamp);
+
+/* ------------------------------------------------------------------ sky
+   The background used to be one flat colour, which is why the skyline had no
+   depth — a wall of buildings against a wall of paint. A gradient dome, a
+   moon and a few hundred stars cost almost nothing and give the horizon
+   somewhere to sit. The dome rides with the camera so you can never reach it. */
+const skyUni = {
+  topCol: { value: new T.Color(0x0a0c1e) },
+  midCol: { value: new T.Color(0x272037) },
+  botCol: { value: new T.Color(0x272037) },
+};
+const skyDome = new T.Mesh(
+  new T.SphereGeometry(400, 24, 16),
+  new T.ShaderMaterial({
+    uniforms: skyUni,
+    side: T.BackSide,
+    depthWrite: false,
+    fog: false,
+    vertexShader:
+      'varying vec3 vP;\n' +
+      'void main(){ vP = position; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader:
+      'uniform vec3 topCol; uniform vec3 midCol; uniform vec3 botCol; varying vec3 vP;\n' +
+      'void main(){\n' +
+      '  float h = normalize(vP).y;\n' +
+      '  vec3 c = mix(botCol, midCol, smoothstep(-0.08, 0.14, h));\n' +
+      '  c = mix(c, topCol, smoothstep(0.08, 0.70, h));\n' +
+      '  gl_FragColor = vec4(c, 1.0);\n' +
+      '}',
+  })
+);
+skyDome.frustumCulled = false;
+skyDome.renderOrder = -10;
+skyDome.userData.noShadow = true;
+scene.add(skyDome);
+
+const STAR_N = 900;
+const starPos = new Float32Array(STAR_N * 3);
+for (let i = 0; i < STAR_N; i++) {
+  const a = Math.random() * Math.PI * 2;
+  const y = Math.random() * 0.95 + 0.02;
+  const r = Math.sqrt(1 - y * y);
+  starPos[i*3]   = Math.cos(a) * r * 360;
+  starPos[i*3+1] = y * 360;
+  starPos[i*3+2] = Math.sin(a) * r * 360;
+}
+const starGeo = new T.BufferGeometry();
+starGeo.setAttribute('position', new T.BufferAttribute(starPos, 3));
+const starMat = new T.PointsMaterial({ color: 0xdfe6ff, size: 1.7, sizeAttenuation: false,
+                                       transparent: true, opacity: 0, depthWrite: false,
+                                       fog: false, toneMapped: false });
+const stars = new T.Points(starGeo, starMat);
+stars.frustumCulled = false;
+stars.renderOrder = -9;
+scene.add(stars);
+
+const moonMat = new T.MeshBasicMaterial({ color: 0xf6f2e2, transparent: true, opacity: 0,
+                                          depthWrite: false, fog: false, toneMapped: false });
+const moon = new T.Mesh(new T.CircleGeometry(13, 28), moonMat);
+moon.frustumCulled = false;
+moon.renderOrder = -8;
+scene.add(moon);
+const MOON_DIR = new T.Vector3(0.46, 0.50, -0.73).normalize();
+
+/* one shared radial-gradient sprite texture — every glow in the game is a
+   tinted, scaled copy of it, so the whole lighting bloom costs one texture */
+const glowTex = (function () {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const x = c.getContext('2d');
+  const g = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0.00, 'rgba(255,255,255,1)');
+  g.addColorStop(0.28, 'rgba(255,255,255,.55)');
+  g.addColorStop(1.00, 'rgba(255,255,255,0)');
+  x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+  return new T.CanvasTexture(c);
+})();
+
+function glowSprite (color, size, opacity) {
+  const s = new T.Sprite(new T.SpriteMaterial({
+    map: glowTex, color: color, transparent: true, opacity: opacity === undefined ? 0.85 : opacity,
+    blending: T.AdditiveBlending, depthWrite: false, fog: true, toneMapped: false,
+  }));
+  s.scale.set(size, size, 1);
+  return s;
+}
+
+const moonGlow = glowSprite(0xbfd0ff, 92, 0);
+moonGlow.renderOrder = -9;
+scene.add(moonGlow);
 
 /* ------------------------------------------------------------ day & night
    Two ways to play. NIGHT ONLY is the endless siege. CYCLE gives you five
@@ -578,12 +737,28 @@ function applySky (t) {
   if (wx.dark > 0.001) _skyC.multiplyScalar(1 - wx.dark * 0.55);
   sun.intensity = L(SKY.night.sun, SKY.day.sun) * (1 - wx.dark);
   sun.color.copy(_sunA).lerp(_sunB, t);
-  sun.position.set(L(SKY.night.sunX, SKY.day.sunX), L(SKY.night.sunY, SKY.day.sunY), 60);
+  sunDir.set(L(SKY.night.sunX, SKY.day.sunX), L(SKY.night.sunY, SKY.day.sunY), 60).normalize();
   hemi.intensity = L(SKY.night.hemi, SKY.day.hemi) * (1 - wx.dark * 0.5);
   hemi.color.copy(_hUpA).lerp(_hUpB, t);
   hemi.groundColor.copy(_hDnA).lerp(_hDnB, t);
   playerLamp.intensity = L(SKY.night.lamp, SKY.day.lamp);
+
+  // dome: horizon matches the fog exactly so the skyline dissolves into it,
+  // the zenith pulls away toward deep blue (night) or open sky (day)
+  skyUni.botCol.value.copy(scene.fog.color);
+  skyUni.midCol.value.copy(_skyC);
+  _topC.copy(_topN).lerp(_topD, t);
+  skyUni.topCol.value.copy(_skyC).lerp(_topC, 0.78 * (1 - wx.dark * 0.6));
+
+  const night = (1 - t) * (1 - wx.dark * 0.8);
+  starMat.opacity = night * 0.95;
+  stars.visible = starMat.opacity > 0.02;
+  moonMat.opacity = night;
+  moon.visible = night > 0.02;
+  moonGlow.material.opacity = night * 0.5;
+  moonGlow.visible = moon.visible;
 }
+const _topN = new T.Color(0x090c22), _topD = new T.Color(0x3d74c4), _topC = new T.Color();
 
 /* ------------------------------------------------------------------ weather
    Rolls a new front every few minutes. Rain is a wrapping block of line
@@ -786,6 +961,7 @@ function box (mat, x, y, z, sx, sy, sz, solid) {
   const m = new T.Mesh(boxGeo, mat);
   m.position.set(x, y, z);
   m.scale.set(sx, sy, sz);
+  if (worldBuilding) m.userData.bake = true;
   scene.add(m);
   if (solid) addObstacle(m, x, z, sx/2, sz/2, y - sy/2, y + sy/2);
   return m;
@@ -810,6 +986,7 @@ function ramp (mat, x, z, loY, hiY, axis, dir, len, wide) {
     m.scale.set(wide, 0.30, Math.hypot(len, rise));
     m.rotation.x = dir > 0 ? -ang : ang;
   }
+  if (worldBuilding) m.userData.bake = true;
   scene.add(m);
   const hx = axis === 'x' ? len/2 : wide/2;
   const hz = axis === 'x' ? wide/2 : len/2;
@@ -848,9 +1025,15 @@ function watchtower (x, z) {
 }
 
 /* stacked containers with a ramp onto the low one */
+/* Four shared materials, not one per crate. Two meshes can only be drawn in a
+   single call if they point at the *same* material object — a new
+   MeshLambertMaterial per container, even in an identical colour, is a
+   different object and forces its own draw call. */
+const containerMats = [0x9a5a3c, 0x3d6b7a, 0x6b7a3d, 0x7a3d55]
+  .map(c => new T.MeshLambertMaterial({ color: c }));
+
 function containerStack (x, z) {
-  const cols = [0x9a5a3c, 0x3d6b7a, 0x6b7a3d, 0x7a3d55];
-  const mat = () => new T.MeshLambertMaterial({ color: cols[(Math.random()*cols.length)|0] });
+  const mat = () => containerMats[(Math.random() * containerMats.length) | 0];
   const rot = Math.random() < 0.5;
   const W = rot ? 2.6 : 7.2, D = rot ? 7.2 : 2.6;
   box(mat(), x, 1.35, z, W, 2.7, D, true);
@@ -862,11 +1045,45 @@ function containerStack (x, z) {
 
 const roofTops = [];
 
+/* True only while buildWorld runs, so the primitives above can tell permanent
+   scenery apart from pooled meshes (blood, pickups, tracers) that were created
+   earlier and must never be baked into the static batch. */
+let worldBuilding = false;
+
+/* Walk the whole scene once and opt every solid mesh into the shadow pass.
+   MeshBasicMaterial is skipped on purpose — that is what the invisible
+   hitboxes, lamp bulbs and muzzle flashes use, and none of them should be
+   throwing a silhouette. */
+function enableShadows (root) {
+  root.traverse(o => {
+    if (!o.isMesh || !o.material) return;
+    if (o.material.isMeshBasicMaterial || o.material.visible === false) return;
+    if (o.userData.noShadow) return;      // sky dome, moon: 400m of nothing
+    o.castShadow = !o.userData.noCast;
+    o.receiveShadow = true;
+  });
+}
+
+/* Runtime meshes miss the one-time walk above, so anything built, dropped or
+   spawned mid-run opts in through here instead. */
+function shadowify (obj) {
+  if (!obj) return;
+  obj.traverse(o => {
+    if (!o.isMesh || !o.material) return;
+    if (o.material.isMeshBasicMaterial || o.material.visible === false) return;
+    if (o.userData.noShadow) return;
+    o.castShadow = !o.userData.noCast;
+    o.receiveShadow = true;
+  });
+}
+
 function buildWorld () {
+  worldBuilding = true;
   // ground
   const g = new T.Mesh(new T.PlaneGeometry(MAP_HALF*2, MAP_HALF*2),
                        new T.MeshLambertMaterial({ map: makeGroundTexture() }));
   g.rotation.x = -Math.PI/2;
+  g.userData.noCast = true;      // a flat plane shadowing itself is just acne
   scene.add(g);
 
   // perimeter — the city is fenced in, so the horde always finds you
@@ -902,6 +1119,9 @@ function buildWorld () {
                                 new T.MeshBasicMaterial({ color:0xffcf8a }));
         bulb.position.set(lx, 6.1, lz);
         scene.add(bulb);
+        const halo = glowSprite(0xffc27a, 5.2, 0.55);
+        halo.position.set(lx, 6.1, lz);
+        scene.add(halo);
       }
     }
   }
@@ -913,6 +1133,104 @@ function buildWorld () {
   containerStack(-18, 16);
   tieredBlock(-30, -34, 6);
   tieredBlock(4, -40, 9);
+  worldBuilding = false;
+}
+
+/* ==================================================================== static
+   batching
+
+   Every wall, crate, railing post and roof panel used to be its own Mesh, which
+   means its own draw call: the CPU stops, hands the GPU one box, waits, hands
+   it the next. Roughly fifteen hundred of those a frame, doubled again now that
+   shadows re-render the same scenery from the sun's point of view.
+
+   Nothing in the city ever moves or breaks, so all of it can be welded into a
+   handful of big meshes ahead of time — think posting three hundred letters
+   individually versus putting them all in one parcel. Same contents, one trip.
+
+   Two things keep this honest:
+
+   * Meshes are grouped by CHUNK as well as by material. One mesh spanning the
+     whole map would have a map-sized bounding box, so the GPU could never skip
+     the half of the city behind you. Chunked, culling still works per block.
+   * The original meshes stay alive in `solids` for bullet raycasts, they are
+     just removed from the scene. A Mesh does not need a parent to be raycast —
+     it only needs a current matrixWorld, which addObstacle already guarantees.
+   ====================================================================== */
+const BAKE_CHUNK = 80;
+
+function mergeMeshes (meshes, material) {
+  let vTotal = 0;
+  const parts = [];
+  for (let i = 0; i < meshes.length; i++) {
+    const src = meshes[i].geometry;
+    const g = src.index ? src.toNonIndexed() : src.clone();
+    g.applyMatrix4(meshes[i].matrixWorld);      // also fixes normals via the normal matrix
+    parts.push(g);
+    vTotal += g.attributes.position.count;
+  }
+  const pos = new Float32Array(vTotal * 3);
+  const nor = new Float32Array(vTotal * 3);
+  const uv  = new Float32Array(vTotal * 2);
+  let v = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const g = parts[i];
+    const p = g.attributes.position, n = g.attributes.normal, u = g.attributes.uv;
+    pos.set(p.array, v * 3);
+    if (n) nor.set(n.array, v * 3);
+    if (u) uv.set(u.array, v * 2);
+    v += p.count;
+    g.dispose();
+  }
+  const out = new T.BufferGeometry();
+  out.setAttribute('position', new T.BufferAttribute(pos, 3));
+  out.setAttribute('normal',   new T.BufferAttribute(nor, 3));
+  out.setAttribute('uv',       new T.BufferAttribute(uv, 2));
+  out.computeBoundingSphere();
+  out.computeBoundingBox();
+  const m = new T.Mesh(out, material);
+  m.matrixAutoUpdate = false;                   // it will never move again
+  return m;
+}
+
+function bakeStatic () {
+  scene.updateMatrixWorld(true);
+
+  const groups = new Map();
+  const mats = [];
+  const originals = [];
+
+  for (let i = 0; i < scene.children.length; i++) {
+    const o = scene.children[i];
+    if (!o.isMesh || !o.userData.bake || !o.material || Array.isArray(o.material)) continue;
+    let mi = mats.indexOf(o.material);
+    if (mi < 0) { mi = mats.length; mats.push(o.material); }
+    const cx = Math.floor(o.position.x / BAKE_CHUNK);
+    const cz = Math.floor(o.position.z / BAKE_CHUNK);
+    const key = cx + '|' + cz + '|' + mi;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(o);
+    originals.push(o);
+  }
+
+  let baked = 0;
+  groups.forEach((list, key) => {
+    if (list.length < 2) return;                // a lone mesh gains nothing
+    const mat = mats[+key.split('|')[2]];
+    const m = mergeMeshes(list, mat);
+    m.userData.noCast = mat.isMeshBasicMaterial;
+    scene.add(m);
+    baked++;
+    for (let i = 0; i < list.length; i++) list[i].userData.baked = true;
+  });
+
+  // pull the originals out of the scene; solids still holds them for raycasts
+  for (let i = 0; i < originals.length; i++) {
+    if (originals[i].userData.baked) scene.remove(originals[i]);
+    else originals[i].matrixAutoUpdate = false;
+  }
+
+  return { source: originals.length, batches: baked };
 }
 
 /* ---- building kinds ------------------------------------------------------ */
@@ -1151,6 +1469,54 @@ function linkRoofs () {
 const nearby = [];
 const hitInfo = { blocker: null };
 const atVec = new T.Vector3();
+/* Bullets used to be tested against every solid mesh in the city — roughly
+   fifteen hundred of them, nine times over for a shotgun blast, plus a fresh
+   1500-element array allocated per shot by solids.concat(). The obstacles are
+   already sorted into a 20-metre grid for collision, so march the ray through
+   that grid instead and only hand the raycaster the meshes it could plausibly
+   touch. Looking up a street name in an A-to-Z rather than reading the whole
+   book: same answer, a fraction of the paper.
+
+   `rayStamp` is a visited-marker so an obstacle spanning four buckets is still
+   only added once, without the cost of an indexOf per candidate. */
+let rayStamp = new Int32Array(8192);
+let rayEpoch = 0;
+const rayHitList = [];
+
+function solidsAlong (origin, dir, far, extra) {
+  if (rayStamp.length < obstacles.length) {      // player built past the marker array
+    const bigger = new Int32Array(obstacles.length * 2);
+    bigger.set(rayStamp);
+    rayStamp = bigger;
+  }
+  rayEpoch++;
+  rayHitList.length = 0;
+  const step = GRID_CELL * 0.5;
+  const n = Math.ceil(far / step) + 1;
+  for (let i = 0; i <= n; i++) {
+    const t = Math.min(i * step, far);
+    const px = origin.x + dir.x * t;
+    const pz = origin.z + dir.z * t;
+    const cx = Math.floor((px + MAP_HALF) / GRID_CELL);
+    const cz = Math.floor((pz + MAP_HALF) / GRID_CELL);
+    // a 3x3 of buckets, so anything straddling a boundary is still caught
+    for (let ax = cx - 1; ax <= cx + 1; ax++)
+      for (let az = cz - 1; az <= cz + 1; az++) {
+        const list = buckets.get(bucketKey(ax, az));
+        if (!list) continue;
+        for (let k = 0; k < list.length; k++) {
+          const idx = list[k];
+          if (rayStamp[idx] === rayEpoch) continue;
+          rayStamp[idx] = rayEpoch;
+          const o = obstacles[idx];
+          if (o && o.mesh && !o.dead) rayHitList.push(o.mesh);
+        }
+      }
+  }
+  if (extra) for (let i = 0; i < extra.length; i++) rayHitList.push(extra[i]);
+  return rayHitList;
+}
+
 function collectNearby (x, z, pad) {
   nearby.length = 0;
   const c0 = Math.floor((x - pad + MAP_HALF) / GRID_CELL);
@@ -1581,7 +1947,7 @@ function hurtZombie (z, dmg, headshot, point) {
     Sfx.erupt(at3(z.mound.position, 6, 90));
     toast('BURROWER FLUSHED OUT');
   } else {
-    bloodBurst(point, headshot ? 14 : 8);
+    bloodBurst(point, Math.round((headshot ? 14 : 8) * GORE.mult));
   }
   Sfx.flesh(at3(point || z.g.position, 4, 70), !!T.armour);
   hitmarker();
@@ -1875,7 +2241,23 @@ function updateZombies (dt) {
 
 /* ---------------------------------------------------------------- blood */
 const bloodGeo = new T.BoxGeometry(0.09, 0.09, 0.09);
+/* ---------------------------------------------------------------- rating
+   PG under the Australian classification scheme allows violence of MILD impact
+   only. Red spray on every hit is what pushes a game like this to M, so PG mode
+   recolours the impact particle to a pale spore burst and thins it out. The
+   mechanics are untouched — it is the depiction that carries the rating, not
+   the act. Off by default only if you deliberately turn it off. */
+const GORE = { pg: true, mult: 0.55 };
 const bloodMat = new T.MeshBasicMaterial({ color: 0x8e1b1b });
+
+function applyPG (on) {
+  GORE.pg = !!on;
+  GORE.mult = on ? 0.55 : 1;
+  bloodMat.color.setHex(on ? 0x9fbe86 : 0x8e1b1b);
+  document.body.classList.toggle('pg', GORE.pg);
+  const b = $('pgBtn');
+  if (b) { b.classList.toggle('on', GORE.pg); b.textContent = GORE.pg ? 'PG MODE: ON' : 'PG MODE: OFF'; }
+}
 const dustMat  = new T.MeshBasicMaterial({ color: 0xb9b2a4 });
 const dirtPMat = new T.MeshBasicMaterial({ color: 0x6b5236 });
 const blood = [];
@@ -1932,7 +2314,9 @@ const ammoMat = new T.MeshLambertMaterial({ color: 0xffb64a, emissive: 0x4a3208 
 for (let i = 0; i < 18; i++) {
   const m = new T.Mesh(medGeo, medMat);
   m.visible = false; scene.add(m);
-  pickups.push({ m, kind:'med', life:0 });
+  const halo = glowSprite(0xff5a4a, 2.4, 0.6);   // recoloured per kind on drop
+  m.add(halo);
+  pickups.push({ m, halo, kind:'med', life:0 });
 }
 function dropPickup (x, z) {
   for (let i = 0; i < pickups.length; i++) {
@@ -1941,6 +2325,7 @@ function dropPickup (x, z) {
     p.kind = Math.random() < 0.42 ? 'med' : 'ammo';
     p.m.geometry = p.kind === 'med' ? medGeo : ammoGeo;
     p.m.material = p.kind === 'med' ? medMat : ammoMat;
+    if (p.halo) p.halo.material.color.setHex(p.kind === 'med' ? 0xff5a4a : 0xffb64a);
     p.m.position.set(x, 0.5, z);
     p.m.visible = true;
     p.life = 26;
@@ -2091,6 +2476,9 @@ function makeFlash (z, size) {
     p.rotation.z = i * 1.05;
     f.add(p);
   }
+  const halo = glowSprite(0xffc978, size * 5.0, 0.9);
+  halo.position.z = -size * 0.7;
+  f.add(halo);
   f.position.z = z;
   f.visible = false;
   return f;
@@ -2357,6 +2745,8 @@ const PROFILE = {
   mode: 'night',                         // 'night' = endless siege, 'cycle' = day/night
   upgrades: {},                          // weapon id -> { dmg, mag, reload }
   input: { sens: 1.0, invertY: false, smooth: false, trackpad: false },
+  gfx: 'high',                           // 'high' | 'med' | 'low'
+  pg: true,                              // classification-safe presentation
 };
 WEAPONS.forEach(w => { PROFILE.skins[w.id] = 'gunmetal'; });
 
@@ -2382,6 +2772,8 @@ function loadProfile () {
     });
     if (typeof p.fullKit === 'boolean') PROFILE.fullKit = p.fullKit;
     if (p.mode === 'night' || p.mode === 'cycle') PROFILE.mode = p.mode;
+    if (p.gfx && GFX_TIERS[p.gfx]) PROFILE.gfx = p.gfx;
+    if (typeof p.pg === 'boolean') PROFILE.pg = p.pg;
     if (p.input && typeof p.input === 'object') {
       const I = p.input;
       if (Number.isFinite(I.sens)) PROFILE.input.sens = clamp(I.sens, 0.2, 4);
@@ -2548,7 +2940,7 @@ function explode (pos, radius, dmg) {
   blastLight.position.copy(pos);
   blastLight.intensity = 9;
 
-  bloodBurst(pos, 26);
+  bloodBurst(pos, Math.round(26 * GORE.mult));
   for (let i = 0; i < 14; i++) {
     const p = blood[bloodPtr = (bloodPtr + 1) % blood.length];
     p.m.material = dustMat;
@@ -2665,7 +3057,8 @@ function fire () {
 
   let spread = w.spread * (player.sprinting ? 1.9 : 1) * (player.onGround ? 1 : 2.1);
   spread *= 1 - 0.6 * gunState.adsT;
-  const targets = solids.concat(hitList);
+  // gathered once per trigger pull, shared by every pellet
+  const targets = solidsAlong(camPos, fwd, w.range, hitList).slice();
 
   for (let p = 0; p < w.pellets; p++) {
     shotDir.copy(fwd)
@@ -2694,6 +3087,7 @@ function fire () {
     if (!end) end = camPos.clone().add(shotDir.clone().multiplyScalar(w.range));
 
     tracer(muzzleWorld, end);
+    if (window.NET && NET.onLocalShot) NET.onLocalShot(muzzleWorld, end, gunState.cur);
 
     if (hitAny && !struck.length) {
       const p2 = blood[bloodPtr = (bloodPtr + 1) % blood.length];
@@ -2768,6 +3162,12 @@ const player = {
   yaw: 0, pitch: 0,
   onGround: true, sprinting: false,
   hp: 100, bob: 0, feet: 0, stepDist: 0,
+  /* movement feel — pos.y always stays feet + EYE so every other system keeps
+     working; crouch, step-up and landing are camera offsets applied on top */
+  crouch: 0, height: STAND_H,
+  coyote: 0, jumpBuf: 0,
+  sliding: false, slideT: 0, slideCd: 0,
+  stepOff: 0, landDip: 0, strafe: 0,
 };
 
 const keys = Object.create(null);
@@ -2830,29 +3230,84 @@ function movePlayer (dt) {
   const len = Math.hypot(ix, iz);
   if (len > 0) { ix /= len; iz /= len; }
 
-  player.sprinting = !!(keys['shift'] && len > 0);
-  const target = player.sprinting ? SPRINT : WALK;
-
   const sy = Math.sin(player.yaw), cy = Math.cos(player.yaw);
   // three.js cameras look down -Z, so forward = (-sin yaw, -cos yaw)
   // and right = (cos yaw, -sin yaw). Rotate the WASD input onto those.
-  const desiredX = ( ix * cy - iz * sy) * target;
-  const desiredZ = (-ix * sy - iz * cy) * target;
+  const wishX = ( ix * cy - iz * sy);
+  const wishZ = (-ix * sy - iz * cy);
 
-  const a = ACCEL * dt;
-  player.vel.x += (desiredX - player.vel.x) * Math.min(a / target * 1.2, 1);
-  player.vel.z += (desiredZ - player.vel.z) * Math.min(a / target * 1.2, 1);
-  if (len === 0) {
-    const f = Math.max(0, 1 - FRICTION * dt);
-    player.vel.x *= f; player.vel.z *= f;
+  let speed = Math.hypot(player.vel.x, player.vel.z);
+  const crouchKey = !!(keys['control'] || keys['c']);
+
+  /* ---- slide: crouch out of a sprint and you keep the momentum ---- */
+  player.slideCd -= dt;
+  if (crouchKey && !player.sliding && player.slideCd <= 0 && player.onGround &&
+      player.sprinting && speed > SPRINT * 0.72) {
+    player.sliding = true;
+    player.slideT = SLIDE_TIME;
+    const boost = SLIDE_SPD / Math.max(0.001, speed);
+    if (boost > 1) { player.vel.x *= boost; player.vel.z *= boost; }
+    Sfx.step(null, true);
+  }
+  if (player.sliding) {
+    player.slideT -= dt;
+    if (player.slideT <= 0 || !player.onGround || speed < 3.4 || !crouchKey) {
+      player.sliding = false;
+      player.slideCd = SLIDE_CD;
+    }
   }
 
-  if ((keys[' '] || keys['space']) && player.onGround) {
-    player.vel.y = JUMP; player.onGround = false;
+  /* ---- crouch blend, with a ceiling check before standing back up ---- */
+  let wantCrouch = crouchKey || player.sliding;
+  if (!wantCrouch && player.crouch > 0.02) {
+    const f = player.pos.y - EYE;
+    if (!isClear(player.pos.x, player.pos.z, P_RADIUS, f + CROUCH_H, f + STAND_H)) wantCrouch = true;
+  }
+  player.crouch += ((wantCrouch ? 1 : 0) - player.crouch) * Math.min(1, dt * 13);
+  player.height = STAND_H + (CROUCH_H - STAND_H) * player.crouch;
+
+  /* ---- horizontal acceleration ---- */
+  const canSprint = !player.sliding && player.crouch < 0.5 && iz > 0.1;
+  player.sprinting = !!(keys['shift'] && len > 0 && canSprint);
+  let target = player.sprinting ? SPRINT : WALK;
+  target *= 1 - 0.55 * player.crouch;
+
+  if (player.sliding) {
+    // a slide steers, it does not accelerate — friction bleeds it off
+    const f = Math.max(0, 1 - 2.1 * dt);
+    player.vel.x *= f; player.vel.z *= f;
+    player.vel.x += wishX * 5.5 * dt;
+    player.vel.z += wishZ * 5.5 * dt;
+  } else {
+    /* Frame-rate independent approach: 1 - e^(-rate*dt) always covers the same
+       fraction of the gap per second, whether you are on 30fps or 240. In the
+       air you only get AIR_CTRL of that rate, so a jump commits you to a
+       direction instead of letting you steer like a drone. */
+    const rate = (ACCEL / Math.max(target, 0.001)) * (player.onGround ? 1 : AIR_CTRL);
+    const k = 1 - Math.exp(-rate * dt);
+    player.vel.x += (wishX * target - player.vel.x) * k;
+    player.vel.z += (wishZ * target - player.vel.z) * k;
+    if (len === 0 && player.onGround) {
+      const f = Math.max(0, 1 - FRICTION * dt);
+      player.vel.x *= f; player.vel.z *= f;
+    }
+  }
+
+  /* ---- jump, with coyote time and an input buffer ---- */
+  if (player.onGround) player.coyote = COYOTE; else player.coyote -= dt;
+  player.jumpBuf -= dt;
+  if (keys[' '] || keys['space']) player.jumpBuf = JUMP_BUF;
+  if (player.jumpBuf > 0 && player.coyote > 0) {
+    player.vel.y = JUMP;
+    player.onGround = false;
+    player.coyote = 0; player.jumpBuf = 0;
+    if (player.sliding) { player.sliding = false; player.slideCd = SLIDE_CD * 0.5; }
+    Sfx.step(null, player.feet > 0.2);
   }
   player.vel.y -= GRAVITY * dt;
 
   const prevFeet = player.pos.y - EYE;
+  const fallVel = player.vel.y;
   player.pos.x += player.vel.x * dt;
   player.pos.z += player.vel.z * dt;
   player.pos.y += player.vel.y * dt;
@@ -2861,25 +3316,40 @@ function movePlayer (dt) {
   const ground = groundAt(player.pos.x, player.pos.z, P_RADIUS, prevFeet, STEP_P);
 
   let feet = player.pos.y - EYE;
+  const wasAir = !player.onGround;
   if (feet <= ground) {
+    const rise = ground - feet;
     player.pos.y = ground + EYE; feet = ground;
     player.vel.y = 0; player.onGround = true;
+    if (wasAir && fallVel < -6) {
+      // land heavy and the camera absorbs it, like knees taking the drop
+      player.landDip = clamp((-fallVel - 6) / 15, 0, 1);
+      Sfx.step(null, true);
+    } else if (!wasAir && rise > 0.08) {
+      // stepping onto a kerb: the body snaps up, the camera catches up after
+      player.stepOff = Math.min(player.stepOff + rise, 0.75);
+    }
   } else {
     player.onGround = false;
   }
 
-  resolve(player.pos, P_RADIUS, feet, 1.75, null, STEP_P);
+  resolve(player.pos, P_RADIUS, feet, player.height, null, STEP_P);
   player.feet = feet;
 
+  player.stepOff *= Math.max(0, 1 - 13 * dt);
+  player.landDip *= Math.max(0, 1 - 7 * dt);
+  player.strafe += (ix - player.strafe) * Math.min(1, dt * 9);
+
   // head bob — a metronome tied to how fast the legs are actually moving
-  const speed = Math.hypot(player.vel.x, player.vel.z);
+  speed = Math.hypot(player.vel.x, player.vel.z);
   player.bob += dt * speed * 1.5;
   if (speed < 0.4) player.bob *= 0.9;
 
   // footsteps fall on distance covered, so they stay in step at any pace
-  if (player.onGround && speed > 0.6) {
+  if (player.onGround && speed > 0.6 && !player.sliding) {
     player.stepDist += speed * dt;
-    if (player.stepDist > (player.sprinting ? 2.05 : 1.75)) {
+    const stride = player.sprinting ? 2.05 : player.crouch > 0.5 ? 1.45 : 1.75;
+    if (player.stepDist > stride) {
       player.stepDist = 0;
       Sfx.step(null, feet > 0.2);          // harder sound up on metal and concrete
     }
@@ -2900,7 +3370,9 @@ const game = {
   elapsed: 0,
 };
 
-function waveQuota (n) { return Math.round(5 + n * 2.6); }
+/* Steeper ramp and a bigger batch on screen: a wave that takes four minutes to
+   grind through is unwatchable in a three-minute video. */
+function waveQuota (n) { return Math.round(5 + n * 3.2); }
 function waveCap (n)   { return Math.min(8 + n * 2, MAX_ZOMBIES); }
 
 function startWave () {
@@ -2950,7 +3422,7 @@ function updateWaves (dt) {
   if (game.toSpawn > 0) {
     game.spawnT -= dt;
     if (game.spawnT <= 0 && game.zAlive < waveCap(game.wave)) {
-      const batch = Math.min(game.toSpawn, 1 + (Math.random() < 0.4 ? 1 : 0));
+      const batch = Math.min(game.toSpawn, 2 + (Math.random() < 0.5 ? 1 : 0));
       for (let i = 0; i < batch; i++) {
         const kind = game.bossQueue && game.bossQueue.length
                    ? game.bossQueue[0] : pickType(game.wave);
@@ -2959,16 +3431,16 @@ function updateWaves (dt) {
           if (game.bossQueue && game.bossQueue.length) game.bossQueue.shift();
         }
       }
-      game.spawnT = Math.max(0.22, 0.9 - game.wave * 0.02);
+      game.spawnT = Math.max(0.14, 0.62 - game.wave * 0.02);
     }
   } else if (game.zAlive === 0) {
     game.inBreak = true;
-    game.breakT = 6;
+    game.breakT = 3.5;
     player.hp = Math.min(100, player.hp + 25);
     resupply(0.75);
     game.score += 250 * game.wave;
     banner('WAVE ' + game.wave + ' CLEARED');
-    toast('+25 VITALS  ·  AMMO DROP  ·  NEXT WAVE IN 6');
+    toast('+25 VITALS  ·  AMMO DROP  ·  NEXT WAVE');
     syncHud();
   }
 }
@@ -3187,6 +3659,70 @@ function drawMinimap () {
   mctx.strokeRect(0.5, 0.5, S-1, S-1);
 }
 
+/* ============================================================ capture tools
+   Everything a piece of footage needs that playing the game does not: a clean
+   frame with no readouts, a still you can drop into an edit, and slow motion
+   for the moment you want to talk over.
+
+   The screenshot cannot just call canvas.toDataURL() on demand — WebGL clears
+   its drawing buffer after every present, so grabbing it a millisecond later
+   returns a blank image. Instead the request is queued and serviced at the very
+   end of frame(), while the pixels are still there.
+   ======================================================================== */
+const film = { hud: true, slowmo: false, shot: false, on: false };
+
+function toggleHud () {
+  film.hud = !film.hud;
+  $('hud').style.visibility = film.hud ? '' : 'hidden';
+}
+
+function grabShot () {
+  film.shot = true;                    // serviced at the end of the render
+}
+
+function saveShot () {
+  film.shot = false;
+  try {
+    const url = canvas.toDataURL('image/png');
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'horde-' + Date.now() + '.png';
+    a.click();
+    toast('SCREENSHOT SAVED');
+  } catch (err) { toast('SCREENSHOT FAILED'); }
+}
+
+function toggleFilm () {
+  film.on = !film.on;
+  const b = $('filmBtn');
+  if (b) { b.classList.toggle('on', film.on); b.textContent = film.on ? 'FILM MODE: ON' : 'FILM MODE: OFF'; }
+  if (film.on) {
+    for (let i = 0; i < WEAPONS.length; i++) gunState.unlocked[i] = true;
+    buildSlots(); syncHud();
+    toast('FILM MODE — [ ] SET WAVE, ALL WEAPONS DRAWN');
+  } else {
+    refreshAvailability(false);
+    toast('FILM MODE OFF');
+  }
+}
+
+/* Jump the run to a wave so you can film the boss without playing to ten. */
+function setWave (n) {
+  game.wave = Math.max(1, n);
+  game.toSpawn = 0;
+  game.inBreak = true;
+  game.breakT = 1.2;
+  for (let i = 0; i < zombies.length; i++) {
+    const z = zombies[i];
+    if (z.alive) { z.alive = false; z.dying = false; z.g.visible = false; }
+  }
+  game.zAlive = 0;
+  game.boss = false; game.bossQueue = null;
+  refreshAvailability(false);
+  banner('WAVE ' + game.wave);
+  syncHud();
+}
+
 /* ---------------------------------------------------------------- input */
 addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
@@ -3197,6 +3733,11 @@ addEventListener('keydown', e => {
     return;
   }
   if (k === 'm') { Sfx.toggleMute(); refreshMuteBtn(); toast(Sfx.muted ? 'AUDIO MUTED' : 'AUDIO ON'); return; }
+  if (k === 'h') { toggleHud(); return; }
+  if (k === 'p') { grabShot(); return; }
+  if (k === 'o') { film.slowmo = !film.slowmo; toast(film.slowmo ? 'SLOW MOTION' : 'NORMAL SPEED'); return; }
+  if (film.on && k === ']') { setWave(game.wave + 1); return; }
+  if (film.on && k === '[') { setWave(game.wave - 1); return; }
   if (k === 'n' && isDay()) { goNight(true); toast('YOU CALLED THE NIGHT IN EARLY'); return; }
   // trackpads make click-and-hold while aiming painful, so the mouse buttons
   // all have keyboard equivalents
@@ -3437,6 +3978,8 @@ function placePiece (piece, gx, gy, gz, rot) {
   obs.hp = obs.maxHp = piece.hp;
   obs.piece = piece.id;
   obs.built = true;
+  shadowify(mesh);
+  if (obs.deco) for (let i = 0; i < obs.deco.length; i++) shadowify(obs.deco[i]);
   structures.push(obs);
   if (piece.kind === 'spike') spikeList.push(obs);
   Sfx.build(atXYZ(gx, gy + 1, gz, 4, 40));
@@ -3488,7 +4031,7 @@ function lookTarget () {
   if (best) return best;
   // damaged structure in front
   ray.set(camPos, fwd); ray.far = 4.0;
-  const hits = ray.intersectObjects(solids, false);
+  const hits = ray.intersectObjects(solidsAlong(camPos, fwd, 4.0), false);
   for (let i = 0; i < hits.length; i++) {
     const o = obstacles.find(ob => !ob.dead && ob.mesh === hits[i].object);
     if (o && o.built && o.piece === 'turret') return { type:'turret', obs:o };
@@ -3632,7 +4175,7 @@ function updateTurrets (dt) {
                               best.feet + 1.1 - muzzle.y,
                               best.g.position.z - muzzle.z).normalize();
     ray.set(muzzle, aim); ray.far = TURRET.range;
-    const hits = ray.intersectObjects(solids.concat(hitList), false);
+    const hits = ray.intersectObjects(solidsAlong(muzzle, aim, TURRET.range, hitList), false);
     if (hits.length && !hits[0].object.userData.z) continue;   // wall in the way
 
     t.cd = 60 / TURRET.rpm;
@@ -3689,7 +4232,7 @@ function aimCell () {
   camera.getWorldPosition(camPos);
   camera.getWorldDirection(fwd);
   ray.set(camPos, fwd); ray.far = 9;
-  const hits = ray.intersectObjects(solids, false);
+  const hits = ray.intersectObjects(solidsAlong(camPos, fwd, 9), false);
   let p;
   if (hits.length) p = hits[0].point.clone().addScaledVector(fwd, -0.55);
   else {
@@ -3718,7 +4261,7 @@ function removeAim () {
   camera.getWorldPosition(camPos);
   camera.getWorldDirection(fwd);
   ray.set(camPos, fwd); ray.far = 7;
-  const hits = ray.intersectObjects(solids, false);
+  const hits = ray.intersectObjects(solidsAlong(camPos, fwd, 7), false);
   if (!hits.length) return;
   const o = obstacles.find(ob => !ob.dead && ob.mesh === hits[0].object);
   if (!o || !o.built) { toast('ONLY YOUR OWN BUILDS'); return; }
@@ -3926,7 +4469,18 @@ function refreshInputUI () {
   $('invertBtn').classList.toggle('on', I.invertY);
   $('smoothBtn').classList.toggle('on', I.smooth);
   $('padBtn').classList.toggle('on', I.trackpad);
+  const gb = $('gfxBtn');
+  if (gb) gb.textContent = 'GRAPHICS: ' + GFX_TIERS[gfxLevel].label;
 }
+/* one button cycling HIGH -> MED -> LOW. Shadows are the expensive part, so if
+   the frame rate ever bites, this is the dial to turn. */
+const gfxBtnEl = $('gfxBtn');
+if (gfxBtnEl) gfxBtnEl.addEventListener('click', () => {
+  const order = ['high', 'med', 'low'];
+  PROFILE.gfx = order[(order.indexOf(gfxLevel) + 1) % order.length];
+  applyQuality(PROFILE.gfx, true);
+  saveProfile(); refreshInputUI();
+});
 $('sensSlider').addEventListener('input', e => {
   PROFILE.input.sens = clamp(e.target.value / 100, 0.2, 4);
   PROFILE.input.trackpad = false;
@@ -4066,6 +4620,10 @@ function restart () {
   player.pos.set(0, EYE, 0);
   player.vel.set(0,0,0);
   player.yaw = 0; player.pitch = 0; player.hp = 100;
+  player.crouch = 0; player.height = STAND_H; player.sliding = false;
+  player.slideT = 0; player.slideCd = 0; player.coyote = 0; player.jumpBuf = 0;
+  player.stepOff = 0; player.landDip = 0; player.strafe = 0; player.onGround = true;
+  fovKick = 0; swayX = 0; swayY = 0; swayLastYaw = 0; swayLastPitch = 0;
   for (let i = 0; i < ammo.length; i++) {
     ammo[i].mag = statMag(i);
     ammo[i].res = WEAPONS[i].resMax === Infinity ? Infinity : Math.round(WEAPONS[i].resMax * 0.6);
@@ -4126,9 +4684,22 @@ canvas.addEventListener('click', () => {
 /* ---------------------------------------------------------------- loop */
 buildWorld();
 scatterLoot();
+const bakeStats = bakeStatic();   // must run before enableShadows: it makes new meshes
+enableShadows(scene);
+applySky(0);                   // seed the dome, stars and moon before frame one
+console.log('[horde] static batch: ' + bakeStats.source + ' meshes -> ' +
+            bakeStats.batches + ' draw calls');
 setTimeout(() => { refreshModeBtns(); refreshInputUI(); $('menuScores').innerHTML = scoreTable(-1); }, 0);
 buildPieceBar();
 loadProfile();
+applyQuality(PROFILE.gfx, false);
+applyPG(PROFILE.pg);
+const pgB = $('pgBtn');
+if (pgB) pgB.addEventListener('click', () => {
+  PROFILE.pg = !PROFILE.pg; applyPG(PROFILE.pg); saveProfile();
+});
+const filmB = $('filmBtn');
+if (filmB) filmB.addEventListener('click', toggleFilm);
 loadScores();
 applyAllSkins();
 buildSlots();
@@ -4150,6 +4721,11 @@ window.HORDE = { game, player, zombies, ammo, gunState, camera, scene, renderer,
                  ZTYPES, pickType, buildBossQueue, hurtZombie, dirtBurst, hurtPlayer, Sfx,
                  dmgEdge, updateDamageFlash, isEnclosed, isClear, roofTops,
                  updateCycle, updateWaves, applySky, goDay, goNight, playerLamp,
+                 sun, hemi, skyDome, skyUni, stars, moon, applyQuality, GFX_TIERS,
+                 enableShadows, shadowify, glowSprite, bakeStatic, bakeStats,
+                 film, toggleHud, grabShot, toggleFilm, setWave, applyPG, GORE,
+                 tracer, hitList, WEAPONS, syncHud, banner, toast, EYE, resolve,
+                 lock, pause, resume, beginRun, die, glowSprite,
                  updateWeather, rollWeather, wx, WEATHER, rainMesh, lightning,
                  UPGRADES, buyUpgrade, upgRank, statDmg, statMag, statReload, finishReload, startReload,
                  turrets, updateTurrets, TURRET, refillTurret,
@@ -4159,12 +4735,14 @@ window.HORDE = { game, player, zombies, ammo, gunState, camera, scene, renderer,
 let last = performance.now();
 let scopeOn = false;
 const shakeV = new T.Vector3();
+let fovKick = 0, swayX = 0, swayY = 0, swayLastYaw = 0, swayLastPitch = 0;
 
 function frame (now) {
   requestAnimationFrame(frame);
   let dt = (now - last) / 1000;
   last = now;
   if (dt > 0.05) dt = 0.05;             // don't let a stutter teleport anyone
+  if (film.slowmo) dt *= 0.32;          // everything downstream is dt-driven
 
   if (game.state === 'play') {
     game.time += dt;
@@ -4200,6 +4778,7 @@ function frame (now) {
     updateWeather(dt);
     if (build.on) aimCell();
     updatePrompt();
+    if (window.NET && NET.update) NET.update(dt);
 
     if (gunState.reloading) {
       gunState.reloadT -= dt;
@@ -4224,17 +4803,39 @@ function frame (now) {
   }
 
   // ---- camera ----
-  const bobY = Math.sin(player.bob * 2) * 0.055;
-  const bobX = Math.cos(player.bob) * 0.035;
+  // bob settles down when you aim, so the sight picture stays readable
+  const bobAmt = 1 - gunState.adsT * 0.65;
+  const bobY = Math.sin(player.bob * 2) * 0.055 * bobAmt;
+  const bobX = Math.cos(player.bob) * 0.035 * bobAmt;
   shakeV.set(gauss() * game.shake, gauss() * game.shake, 0);
 
-  camera.position.set(player.pos.x + bobX * 0.35, player.pos.y + bobY, player.pos.z);
+  // everything that lowers the view stacks into one offset: crouch, the dip on
+  // a heavy landing, and the step-up the legs already took but the head hasn't
+  const viewDrop = (EYE - CROUCH_EYE) * player.crouch
+                 + player.landDip * 0.30
+                 + player.stepOff;
+
+  camera.position.set(player.pos.x + bobX * 0.35, player.pos.y + bobY - viewDrop, player.pos.z);
   camera.rotation.set(0, 0, 0);
   camera.rotateY(player.yaw + gunState.recoilYaw + shakeV.x);
-  camera.rotateX(player.pitch + gunState.recoil + shakeV.y);
-  camera.rotateZ(bobX * 0.12);
+  camera.rotateX(player.pitch + gunState.recoil + shakeV.y - player.landDip * 0.10);
+  camera.rotateZ(bobX * 0.12 - player.strafe * 0.028 * (1 - gunState.adsT * 0.7)
+                 - (player.sliding ? 0.10 : 0));
 
-  playerLamp.position.set(player.pos.x, player.pos.y + 0.4, player.pos.z);
+  // the sun rides above you so its shadow box always covers the street you're
+  // standing in, and the sky dome travels with the camera so you never reach it
+  sunTarget.position.set(player.pos.x, 0, player.pos.z);
+  sunTarget.updateMatrixWorld();
+  sun.position.set(player.pos.x + sunDir.x * 140, sunDir.y * 140, player.pos.z + sunDir.z * 140);
+  skyDome.position.copy(camera.position);
+  stars.position.copy(camera.position);
+  if (moon.visible) {
+    moon.position.copy(camera.position).addScaledVector(MOON_DIR, 340);
+    moon.lookAt(camera.position);
+    moonGlow.position.copy(moon.position);
+  }
+
+  playerLamp.position.set(player.pos.x, player.pos.y + 0.4 - viewDrop, player.pos.z);
   camera.getWorldPosition(camPos);
   camera.getWorldDirection(fwd);
   up.set(0, 1, 0).applyQuaternion(camera.quaternion);
@@ -4251,19 +4852,46 @@ function frame (now) {
   const wantAds = gunState.ads && !gunState.reloading && game.state === 'play' ? 1 : 0;
   gunState.adsT += (wantAds - gunState.adsT) * Math.min(1, dt * 13);
   const A = gunState.adsT;
-  const fov = 76 - (76 - 76 * W.zoom) * A;
+  // speed you can feel: the view opens up when you run and snaps wider in a
+  // slide, then closes down again the moment you bring the sights up
+  const wantKick = player.sliding ? 1.7 : (player.sprinting ? 1 : 0);
+  fovKick += (wantKick - fovKick) * Math.min(1, dt * 7);
+  const fov = (76 + fovKick * 5.5 * (1 - A)) - (76 - 76 * W.zoom) * A;
   if (Math.abs(camera.fov - fov) > 0.01) { camera.fov = fov; camera.updateProjectionMatrix(); }
 
   const sp = Math.hypot(player.vel.x, player.vel.z);
   const moving = sp > 0.5 ? 1 - A * 0.8 : 0;
+
+  /* Sway: the gun trails the view instead of being welded to it. Track how far
+     the look moved this frame and let the weapon lag behind, the way a heavy
+     object lags the hands carrying it. Clamped so a fast flick can't fling it
+     off screen, and killed off when aiming so the sights stay put. */
+  const dYaw   = player.yaw   - swayLastYaw;
+  const dPitch = player.pitch - swayLastPitch;
+  swayLastYaw = player.yaw; swayLastPitch = player.pitch;
+  const swayK = Math.min(1, dt * 8);
+  swayX += (clamp(dYaw   * 0.9, -0.055, 0.055) - swayX) * swayK;
+  swayY += (clamp(dPitch * 0.9, -0.045, 0.045) - swayY) * swayK;
+  const swayAmt = 1 - A * 0.85;
+
+  // running with the gun down, then bringing it up — a pose, not a stat
+  const runPose = player.sprinting && A < 0.15 ? 1 : 0;
+  gunState.runT = (gunState.runT || 0) + (runPose - (gunState.runT || 0)) * Math.min(1, dt * 8);
+  const R = gunState.runT;
+
   const hipX = 0.20, hipY = -0.20, hipZ = -0.42;
   const adsX = 0.00, adsY = -0.128, adsZ = -0.30;
   g.position.set(
-    (hipX + (adsX - hipX) * A) + Math.cos(player.bob) * 0.012 * moving,
-    (hipY + (adsY - hipY) * A) + Math.sin(player.bob * 2) * 0.012 * moving - gunState.recoil * 0.5,
-    (hipZ + (adsZ - hipZ) * A) + gunState.kickZ
+    (hipX + (adsX - hipX) * A) + Math.cos(player.bob) * 0.012 * moving + swayX * swayAmt + R * 0.06,
+    (hipY + (adsY - hipY) * A) + Math.sin(player.bob * 2) * 0.012 * moving - gunState.recoil * 0.5
+      + swayY * swayAmt - R * 0.09 - player.landDip * 0.05 - player.crouch * 0.015,
+    (hipZ + (adsZ - hipZ) * A) + gunState.kickZ + R * 0.05
   );
-  g.rotation.set(-gunState.recoil * 2.2, -0.06 * (1 - A), 0.03 * (1 - A));
+  g.rotation.set(
+    -gunState.recoil * 2.2 - swayY * 3.2 * swayAmt + R * 0.38,
+    -0.06 * (1 - A) - swayX * 2.4 * swayAmt - R * 0.30,
+     0.03 * (1 - A) + swayX * 1.6 * swayAmt + R * 0.34
+  );
 
   // slide / bolt / charging handle snapping back on each shot
   gunState.slideT *= Math.max(0, 1 - 16 * dt);
@@ -4307,6 +4935,8 @@ function frame (now) {
   renderer.render(scene, camera);
   renderer.clearDepth();
   renderer.render(gunScene, gunCam);
+
+  if (film.shot) saveShot();            // buffer is still live at this point
 }
 requestAnimationFrame(frame);
 

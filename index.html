@@ -26,6 +26,7 @@
     <span class="stick l"></span><span class="stick r"></span>
   </div>
   <div id="vignette"></div>
+  <div id="grain"></div>
   <div id="dmgEdges">
     <span id="edgeT" class="de t"></span>
     <span id="edgeB" class="de b"></span>
@@ -105,7 +106,7 @@
     <div class="strains">
       <div class="sr"><i style="background:#8fb06a"></i><b>GREEN</b><span>Walker &mdash; the baseline</span></div>
       <div class="sr"><i style="background:#7fa8c4"></i><b>BLUE</b><span>Sprinter &mdash; lean, hunched, fast</span></div>
-      <div class="sr"><i style="background:#d8c452"></i><b>YELLOW</b><span>Bile &mdash; cracked skin, triple damage</span></div>
+      <div class="sr"><i style="background:#d8c452"></i><b>YELLOW</b><span>Bile &mdash; corrosive, triple damage</span></div>
       <div class="sr"><i style="background:#9a4a34"></i><b>RED</b><span>Burrower &mdash; tunnels, erupts underneath you</span></div>
       <div class="sr"><i style="background:#4a4a52"></i><b>BLACK</b><span>Hulk &mdash; armoured, 5&times; health, knocks you flying</span></div>
       <div class="sr"><i style="background:#d977a8"></i><b>PINK</b><span>Abomination &mdash; boss, every tenth wave</span></div>
@@ -116,7 +117,9 @@
       <div class="kr"><b>MOUSE</b><span>Look</span></div>
       <div class="kr"><b>CLICK</b><span>Fire</span></div>
       <div class="kr"><b>SHIFT</b><span>Sprint</span></div>
-      <div class="kr"><b>SPACE</b><span>Jump</span></div>
+      <div class="kr"><b>SPACE</b><span>Jump (hold to hop)</span></div>
+      <div class="kr"><b>CTRL / C</b><span>Crouch &mdash; duck low gaps</span></div>
+      <div class="kr"><b>SHIFT + CTRL</b><span>Slide</span></div>
       <div class="kr"><b>R</b><span>Reload</span></div>
       <div class="kr"><b>RIGHT CLICK</b><span>Aim down sights</span></div>
       <div class="kr"><b>1 &ndash; 8</b><span>Draw loadout slot</span></div>
@@ -126,6 +129,7 @@
       <div class="kr"><b>F / Q / X</b><span>Fire / aim / remove (trackpad)</span></div>
       <div class="kr"><b>N</b><span>Call the night (in cycle mode)</span></div>
       <div class="kr"><b>M</b><span>Mute audio</span></div>
+      <div class="kr"><b>H / P / O</b><span>Hide HUD / screenshot / slow motion</span></div>
       <div class="kr"><b>ESC</b><span>Pause</span></div>
     </div>
 
@@ -134,6 +138,15 @@
       <button id="modeCycle" class="pill">DAY / NIGHT CYCLE</button>
     </div>
     <p id="modeNote" class="modeNote"></p>
+
+    <div class="coopRow">
+      <input id="roomInput" maxlength="12" placeholder="ROOM CODE" autocomplete="off">
+      <input id="nameInput" maxlength="12" placeholder="YOUR NAME" autocomplete="off">
+      <button id="joinBtn" class="pill">JOIN CO-OP</button>
+      <button id="linkBtn" class="pill hidden">COPY INVITE LINK</button>
+    </div>
+    <p class="modeNote">Share the room code with a friend to see each other in the same
+    street. Zombies are still local to each player &mdash; you fight your own wave.</p>
 
     <button id="playBtn">ENTER THE STREETS</button>
     <button id="armouryBtn" class="ghost">ARMOURY</button>
@@ -157,6 +170,9 @@
         <span id="sensVal">1.00&times;</span>
       </div>
       <div class="volRow">
+        <button id="gfxBtn" class="pill">GRAPHICS: HIGH</button>
+        <button id="pgBtn" class="pill on">PG MODE: ON</button>
+        <button id="filmBtn" class="pill">FILM MODE: OFF</button>
         <button id="padBtn" class="pill">TRACKPAD MODE</button>
         <button id="smoothBtn" class="pill">SMOOTHING</button>
         <button id="invertBtn" class="pill">INVERT Y</button>
@@ -164,6 +180,14 @@
       <div class="ctrlNote">
         No mouse buttons needed: <b>F</b> fires (and places), <b>Q</b> toggles aim,
         <b>X</b> removes a build piece. Trackpad mode raises look speed and turns on smoothing.
+        Drop <b>GRAPHICS</b> to MED or LOW if the frame rate dips &mdash; it trades shadow
+        detail and render resolution for speed.
+      </div>
+      <div class="ctrlNote">
+        <b>Capture:</b> <b>H</b> hides the readouts for a clean frame, <b>P</b> saves a PNG,
+        <b>O</b> is slow motion. <b>PG MODE</b> keeps the impact effects at mild impact for
+        classification. <b>FILM MODE</b> draws every weapon and lets <b>[</b> and <b>]</b>
+        set the wave, so you can shoot the boss without playing to ten.
       </div>
     </div>
 
@@ -207,7 +231,40 @@
   </div>
 </div>
 
+<script src="config.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="three.min.js"></script>
 <script src="game.js"></script>
+<script src="net.js"></script>
+<script>
+  (function () {
+    const roomIn = document.getElementById('roomInput');
+    const nameIn = document.getElementById('nameInput');
+    const joinBtn = document.getElementById('joinBtn');
+    const linkBtn = document.getElementById('linkBtn');
+
+    // arriving on an invite link: fill the code in and say so
+    const invited = window.NET.roomFromUrl();
+    if (invited) { roomIn.value = invited.toUpperCase(); joinBtn.textContent = 'JOIN ' + invited.toUpperCase(); }
+
+    // a name you don't have to retype every session
+    try {
+      const saved = localStorage.getItem('horde.name');
+      if (saved) nameIn.value = saved;
+    } catch (e) {}
+
+    joinBtn.addEventListener('click', () => {
+      const room = roomIn.value.trim();
+      const name = nameIn.value.trim() || 'SURVIVOR';
+      if (!room) { roomIn.focus(); return; }
+      try { localStorage.setItem('horde.name', name); } catch (e) {}
+      window.NET.join(room, name);
+      joinBtn.textContent = 'CONNECTING…';
+      linkBtn.classList.remove('hidden');
+    });
+
+    linkBtn.addEventListener('click', () => window.NET.copyLink());
+  })();
+</script>
 </body>
 </html>
