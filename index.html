@@ -140,13 +140,21 @@
     <p id="modeNote" class="modeNote"></p>
 
     <div class="coopRow">
-      <input id="roomInput" maxlength="12" placeholder="ROOM CODE" autocomplete="off">
       <input id="nameInput" maxlength="12" placeholder="YOUR NAME" autocomplete="off">
-      <button id="joinBtn" class="pill">JOIN CO-OP</button>
-      <button id="linkBtn" class="pill hidden">COPY INVITE LINK</button>
+      <button id="hostBtn" class="pill">HOST A GAME</button>
+      <input id="roomInput" maxlength="12" placeholder="CODE" autocomplete="off">
+      <button id="joinBtn" class="pill">JOIN</button>
     </div>
-    <p class="modeNote">Share the room code with a friend to see each other in the same
-    street. Zombies are still local to each player &mdash; you fight your own wave.</p>
+
+    <div id="lobby" class="hidden">
+      <div class="lobbyHead">
+        <span class="lbl">ROOM</span><span id="lobbyCode">----</span>
+        <button id="linkBtn" class="pill">COPY INVITE</button>
+        <button id="leaveBtn" class="pill">LEAVE</button>
+      </div>
+      <div id="lobbyList"></div>
+      <p id="lobbyNote" class="modeNote"></p>
+    </div>
 
     <button id="playBtn">ENTER THE STREETS</button>
     <button id="armouryBtn" class="ghost">ARMOURY</button>
@@ -238,32 +246,67 @@
 <script src="net.js"></script>
 <script>
   (function () {
-    const roomIn = document.getElementById('roomInput');
-    const nameIn = document.getElementById('nameInput');
-    const joinBtn = document.getElementById('joinBtn');
-    const linkBtn = document.getElementById('linkBtn');
+    const $ = id => document.getElementById(id);
+    const roomIn = $('roomInput'), nameIn = $('nameInput');
+    const hostBtn = $('hostBtn'), joinBtn = $('joinBtn'), playBtn = $('playBtn');
+    const lobby = $('lobby'), lobbyList = $('lobbyList'), lobbyNote = $('lobbyNote');
 
-    // arriving on an invite link: fill the code in and say so
-    const invited = window.NET.roomFromUrl();
-    if (invited) { roomIn.value = invited.toUpperCase(); joinBtn.textContent = 'JOIN ' + invited.toUpperCase(); }
+    const myName = () => (nameIn.value.trim() || 'SURVIVOR');
+    const remember = () => { try { localStorage.setItem('horde.name', myName()); } catch (e) {} };
 
-    // a name you don't have to retype every session
     try {
       const saved = localStorage.getItem('horde.name');
       if (saved) nameIn.value = saved;
     } catch (e) {}
 
-    joinBtn.addEventListener('click', () => {
-      const room = roomIn.value.trim();
-      const name = nameIn.value.trim() || 'SURVIVOR';
-      if (!room) { roomIn.focus(); return; }
-      try { localStorage.setItem('horde.name', name); } catch (e) {}
-      window.NET.join(room, name);
-      joinBtn.textContent = 'CONNECTING…';
-      linkBtn.classList.remove('hidden');
+    // arriving on an invite link: prefill the code and point at JOIN
+    const invited = window.NET.roomFromUrl();
+    if (invited) { roomIn.value = invited.toUpperCase(); joinBtn.classList.add('on'); }
+
+    /* The roster redraws from scratch every time presence changes. It is a
+       handful of names, so rebuilding beats trying to diff it. */
+    window.NET.state.onRoster = (list, st) => {
+      if (!st.on) { lobby.classList.add('hidden'); playBtn.textContent = 'ENTER THE STREETS'; return; }
+      lobby.classList.remove('hidden');
+      $('lobbyCode').textContent = st.room;
+      lobbyList.innerHTML = list.map(p =>
+        '<div class="lrow' + (p.me ? ' me' : '') + '">' +
+        '<b>' + p.name + '</b>' +
+        (p.host ? '<span class="tag">HOST</span>' : '') +
+        (p.me ? '<span class="tag you">YOU</span>' : '') + '</div>').join('');
+
+      if (st.isHost) {
+        playBtn.textContent = list.length > 1
+          ? 'START RUN (' + list.length + ' PLAYERS)' : 'START RUN';
+        playBtn.removeAttribute('disabled');
+        lobbyNote.textContent = 'You are the host. Everyone drops in when you hit START.';
+      } else {
+        playBtn.textContent = 'WAITING FOR HOST…';
+        playBtn.setAttribute('disabled', 'disabled');
+        lobbyNote.textContent = 'The host starts the run. Zombies are still local to each player.';
+      }
+    };
+
+    hostBtn.addEventListener('click', () => {
+      remember();
+      hostBtn.textContent = 'CREATING…';
+      window.NET.host(myName());
     });
 
-    linkBtn.addEventListener('click', () => window.NET.copyLink());
+    joinBtn.addEventListener('click', () => {
+      const room = roomIn.value.trim();
+      if (!room) { roomIn.focus(); return; }
+      remember();
+      joinBtn.textContent = 'CONNECTING…';
+      window.NET.join(room, myName());
+    });
+
+    $('linkBtn').addEventListener('click', () => window.NET.copyLink());
+    $('leaveBtn').addEventListener('click', () => {
+      window.NET.leave();
+      hostBtn.textContent = 'HOST A GAME';
+      joinBtn.textContent = 'JOIN';
+    });
   })();
 </script>
 </body>

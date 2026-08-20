@@ -57,6 +57,8 @@ const state = {
   client: null, channel: null,
   peers: new Map(),           // id -> peer record
   sendT: 0, seq: 0,
+  isHost: false, started: false,
+  onRoster: null,             // UI callback, set from index.html
 };
 
 /* ----------------------------------------------------------------- avatar
@@ -121,11 +123,11 @@ function makeNameTag (name, col) {
 }
 
 /* ------------------------------------------------------------------ peers */
-function addPeer (id, name) {
+function addPeer (id, name, host) {
   if (state.peers.has(id) || id === state.id) return;
   const av = makeAvatar(name || 'SURVIVOR', state.peers.size + 1);
   state.peers.set(id, {
-    id, name, av,
+    id, name, av, host: !!host,
     prev: null, next: null,        // the two snapshots we slide between
     lastSeen: performance.now(),
     walk: 0,
@@ -238,7 +240,20 @@ function update (dt) {
 }
 
 /* ------------------------------------------------------------------ joining */
-async function join (room, name) {
+/* Four letters, no vowels — you cannot accidentally generate a rude word, and
+   nothing in it is ambiguous when read aloud. */
+function makeRoomCode () {
+  const L = 'BCDFGHJKLMNPQRSTVWXZ';
+  let s = '';
+  for (let i = 0; i < 4; i++) s += L[(Math.random() * L.length) | 0];
+  return s;
+}
+
+async function host (name) {
+  return join(makeRoomCode(), name, true);
+}
+
+async function join (room, name, asHost) {
   if (state.on) return;
   if (!window.supabase) { H.toast('SUPABASE NOT LOADED'); return; }
   if (!configured) { H.toast('SET YOUR KEYS IN config.js'); return; }
@@ -246,6 +261,8 @@ async function join (room, name) {
   state.name = (name || 'SURVIVOR').toUpperCase().slice(0, 12);
   state.room = (room || 'STREET').toUpperCase().slice(0, 12);
   state.id = Math.random().toString(36).slice(2, 10);
+  state.isHost = !!asHost;
+  state.started = false;
 
   state.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
     realtime: { params: { eventsPerSecond: SEND_HZ + 6 } },
@@ -257,19 +274,31 @@ async function join (room, name) {
 
   state.channel
     .on('broadcast', { event: 'pos'  }, ({ payload }) => onSnapshot(payload))
-    .on('broadcast', { event: 'shot' }, ({ payload }) => onRemoteShot(payload))
+    .on('broadcast', { event: 'shot'  }, ({ payload }) => onRemoteShot(payload))
+    .on('broadcast', { event: 'start' }, ({ payload }) => onStart(payload))
     .on('presence',  { event: 'join'  }, ({ key, newPresences }) => {
       if (key === state.id) return;
       const n = newPresences && newPresences[0];
-      addPeer(key, (n && n.name) || 'SURVIVOR');
+      addPeer(key, (n && n.name) || 'SURVIVOR', n && n.host);
+      pushRoster();
     })
-    .on('presence',  { event: 'leave' }, ({ key }) => dropPeer(key))
+    .on('presence',  { event: 'sync'  }, () => {
+      // authoritative roster: presence state is the whole room, not a delta
+      const all = state.channel.presenceState();
+      Object.keys(all).forEach(key => {
+        if (key === state.id) return;
+        const n = all[key] && all[key][0];
+        addPeer(key, (n && n.name) || 'SURVIVOR', n && n.host);
+      });
+      pushRoster();
+    })
+    .on('presence',  { event: 'leave' }, ({ key }) => { dropPeer(key); pushRoster(); })
     .subscribe(async (status) => {
       if (status !== 'SUBSCRIBED') return;
-      await state.channel.track({ name: state.name, at: Date.now() });
+      await state.channel.track({ name: state.name, host: state.isHost, at: Date.now() });
       state.on = true;
-      H.banner('ROOM ' + state.room);
-      H.toast('CONNECTED AS ' + state.name);
+      H.toast(state.isHost ? 'HOSTING ROOM ' + state.room : 'JOINED ROOM ' + state.room);
+      pushRoster();
     });
 }
 
@@ -277,8 +306,34 @@ function leave () {
   if (!state.on) return;
   state.peers.forEach((p, id) => dropPeer(id));
   if (state.channel) state.channel.unsubscribe();
-  state.on = false;
+  state.on = false; state.isHost = false; state.started = false;
+  pushRoster();
   H.toast('LEFT THE ROOM');
+}
+
+/* Everyone in the room, host first. The UI redraws from this. */
+function roster () {
+  const list = [{ id: state.id, name: state.name, host: state.isHost, me: true }];
+  state.peers.forEach(p => list.push({ id: p.id, name: p.name, host: !!p.host, me: false }));
+  return list;
+}
+
+function pushRoster () {
+  if (state.onRoster) state.onRoster(roster(), state);
+}
+
+/* Host presses START; everyone else drops into the run on the same tick. */
+function sendStart () {
+  if (!state.on || !state.isHost || !state.channel) return;
+  state.started = true;
+  state.channel.send({ type: 'broadcast', event: 'start', payload: { i: state.id } });
+}
+
+function onStart (m) {
+  if (!m || m.i === state.id || state.started) return;
+  state.started = true;
+  H.toast('HOST STARTED THE RUN');
+  H.restart();
 }
 
 /* called from fire() in game.js */
@@ -313,7 +368,8 @@ async function copyLink () {
   }
 }
 
-return { join, leave, update, onLocalShot, state, roomFromUrl, shareLink, copyLink, configured };
+return { join, host, leave, update, onLocalShot, state, roomFromUrl,
+         shareLink, copyLink, configured, roster, sendStart, makeRoomCode };
 
 /* =====================================================================
    PHASE 2 — SHARED ZOMBIES, when you get to it

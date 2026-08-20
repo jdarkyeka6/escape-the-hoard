@@ -4656,7 +4656,12 @@ function restart () {
   beginRun();
 }
 
-$('playBtn').addEventListener('click', () => { restart(); });
+$('playBtn').addEventListener('click', () => {
+  // in a co-op room only the host pulls the trigger; solo, this is just play
+  if (window.NET && NET.state.on && !NET.state.isHost) return;
+  if (window.NET && NET.state.on) NET.sendStart();
+  restart();
+});
 $('armouryBtn').addEventListener('click', () => openArmoury('menu'));
 
 function refreshModeBtns () {
@@ -4725,7 +4730,7 @@ window.HORDE = { game, player, zombies, ammo, gunState, camera, scene, renderer,
                  enableShadows, shadowify, glowSprite, bakeStatic, bakeStats,
                  film, toggleHud, grabShot, toggleFilm, setWave, applyPG, GORE,
                  tracer, hitList, WEAPONS, syncHud, banner, toast, EYE, resolve,
-                 lock, pause, resume, beginRun, die, glowSprite,
+                 lock, pause, resume, beginRun, die, glowSprite, restart,
                  updateWeather, rollWeather, wx, WEATHER, rainMesh, lightning,
                  UPGRADES, buyUpgrade, upgRank, statDmg, statMag, statReload, finishReload, startReload,
                  turrets, updateTurrets, TURRET, refillTurret,
