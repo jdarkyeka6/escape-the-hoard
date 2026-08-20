@@ -240,7 +240,6 @@
 </div>
 
 <script src="config.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script src="three.min.js"></script>
 <script src="game.js"></script>
 <script src="net.js"></script>
@@ -266,7 +265,14 @@
     /* The roster redraws from scratch every time presence changes. It is a
        handful of names, so rebuilding beats trying to diff it. */
     window.NET.state.onRoster = (list, st) => {
-      if (!st.on) { lobby.classList.add('hidden'); playBtn.textContent = 'ENTER THE STREETS'; return; }
+      if (!st.on) {
+        lobby.classList.add('hidden');
+        playBtn.textContent = 'ENTER THE STREETS';
+        playBtn.removeAttribute('disabled');
+        hostBtn.textContent = 'HOST A GAME';
+        joinBtn.textContent = 'JOIN';
+        return;
+      }
       lobby.classList.remove('hidden');
       $('lobbyCode').textContent = st.room;
       lobbyList.innerHTML = list.map(p =>

@@ -4689,11 +4689,17 @@ canvas.addEventListener('click', () => {
 /* ---------------------------------------------------------------- loop */
 buildWorld();
 scatterLoot();
-const bakeStats = bakeStatic();   // must run before enableShadows: it makes new meshes
+/* Batching is an optimisation, never a requirement — if it throws, the game
+   should still start, just slower. */
+let bakeStats = { source: 0, batches: 0 };
+const bakeT0 = performance.now();
+try { bakeStats = bakeStatic(); }
+catch (err) { console.error('[horde] static batch failed, running unbatched', err); }
 enableShadows(scene);
 applySky(0);                   // seed the dome, stars and moon before frame one
 console.log('[horde] static batch: ' + bakeStats.source + ' meshes -> ' +
-            bakeStats.batches + ' draw calls');
+            bakeStats.batches + ' draw calls in ' +
+            Math.round(performance.now() - bakeT0) + 'ms');
 setTimeout(() => { refreshModeBtns(); refreshInputUI(); $('menuScores').innerHTML = scoreTable(-1); }, 0);
 buildPieceBar();
 loadProfile();

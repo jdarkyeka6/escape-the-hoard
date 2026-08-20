@@ -253,10 +253,40 @@ async function host (name) {
   return join(makeRoomCode(), name, true);
 }
 
+/* The Supabase client is fetched only when somebody actually clicks HOST or
+   JOIN. It used to be a plain <script> tag, which meant a slow or blocked CDN
+   stalled the whole page before three.js or the game had even parsed — one
+   unreachable server and you get a black screen with no error. Nothing needed
+   to boot the game lives on the network now. */
+let sbLoading = null;
+
+function loadSupabase () {
+  if (window.supabase) return Promise.resolve(true);
+  if (sbLoading) return sbLoading;
+  sbLoading = new Promise(resolve => {
+    let settled = false;
+    const done = ok => { if (!settled) { settled = true; resolve(ok && !!window.supabase); } };
+    const el = document.createElement('script');
+    el.src = 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2';
+    el.onload  = () => done(true);
+    el.onerror = () => done(false);
+    document.head.appendChild(el);
+    setTimeout(() => done(false), 8000);       // blocked networks hang, not fail
+  });
+  return sbLoading;
+}
+
 async function join (room, name, asHost) {
   if (state.on) return;
-  if (!window.supabase) { H.toast('SUPABASE NOT LOADED'); return; }
   if (!configured) { H.toast('SET YOUR KEYS IN config.js'); return; }
+  H.toast('CONNECTING…');
+  const ready = await loadSupabase();
+  if (!ready) {
+    sbLoading = null;
+    H.toast('CANNOT REACH SUPABASE — CHECK NETWORK');
+    pushRoster();
+    return;
+  }
 
   state.name = (name || 'SURVIVOR').toUpperCase().slice(0, 12);
   state.room = (room || 'STREET').toUpperCase().slice(0, 12);
